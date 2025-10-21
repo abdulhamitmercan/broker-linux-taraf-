@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import json, sys
+import json, sys, time
 import paho.mqtt.client as mqtt
 
 # -------- Frame Handler --------
@@ -34,7 +34,10 @@ def load_settings(path="target.json"):
         with open(path, "r", encoding="utf-8") as f:
             cfg = json.load(f)
     except FileNotFoundError:
-        sys.exit(f"{path} bulunamadı. Örnek:\n{{\"target\":\"30:ED:A0:31:BE:64\",\"control\":\"activate\"}}")
+        sys.exit(
+            f"{path} bulunamadı. Örnek:\n"
+            + '{"target":"30:ED:A0:31:BE:64","control":"activate"}'
+        )
     except json.JSONDecodeError as e:
         sys.exit(f"{path} JSON hatası: {e}")
 
@@ -52,23 +55,51 @@ def load_settings(path="target.json"):
 
 # -------- MQTT ayarları --------
 BROKER = "192.168.1.45"
-PORT = 1883
-USERNAME = "abdulhamit"
-PASSWORD = "q12345"
+PORT   = 1883
+USER   = "abdulhamit"
+PASS   = "q12345"
 
 frameHandler = MqttFrameHandler()
+
+# Globaller (callback içinde kullanacağız)
+TOPIC_CTRL = TOPIC_TX = TOPIC_RX = TOPIC_STATUS = None
+control_state = None
+_last_control_sent = 0.0
+_MIN_RESEND_INTERVAL = 1.0  # saniye (antispam)
+
+def resend_control(client):
+    """JSON'daki control varsa ve debounce uygunsa tekrar gönder."""
+    global _last_control_sent
+    if not control_state:
+        return
+    now = time.time()
+    if now - _last_control_sent < _MIN_RESEND_INTERVAL:
+        return
+    client.publish(TOPIC_CTRL, control_state)
+    _last_control_sent = now
+    print(f"[AUTO] '{control_state}' yeniden gönderildi (sebep: ESP yeniden bağlandı).")
 
 # -------- MQTT callbacks --------
 def on_message(client, userdata, msg):
     payload = msg.payload
-    result = frameHandler.decode_frame(payload)
-    if result:
-        print(f"[{msg.topic}] FRAME → Cmd:{result[0]}, Msg:{result[1]}, Data:{result[2]}")
-    else:
-        print(f"[{msg.topic}] {payload.decode(errors='ignore')}")
+    decoded = frameHandler.decode_frame(payload)
+    if decoded:
+        print(f"[{msg.topic}] FRAME → Cmd:{decoded[0]}, Msg:{decoded[1]}, Data:{decoded[2]}")
+        return
+
+    text = payload.decode(errors='ignore')
+    print(f"[{msg.topic}] {text}")
+
+    # YENİDEN BAĞLANDI tetikleyicisi (status topic)
+    if msg.topic == TOPIC_STATUS:
+        normalized = text.strip().lower()
+        if ("mqtt yeniden bağlandı" in normalized) or ("mqtt reconnected" in normalized) or ("yeniden baglandi" in normalized):
+            resend_control(client)
 
 def main():
-    target, control = load_settings()
+    global TOPIC_CTRL, TOPIC_TX, TOPIC_RX, TOPIC_STATUS, control_state
+
+    target, control_state = load_settings()
 
     TOPIC_CTRL   = f"{target}/control"
     TOPIC_TX     = f"{target}/from_server"
@@ -76,8 +107,7 @@ def main():
     TOPIC_STATUS = f"{target}/status"
 
     client = mqtt.Client("LinuxTerminal")
-    if USERNAME:
-        client.username_pw_set(USERNAME, PASSWORD)
+    client.username_pw_set(USER, PASS)
 
     client.on_message = on_message
     client.connect(BROKER, PORT, 60)
@@ -85,22 +115,19 @@ def main():
     client.subscribe(TOPIC_STATUS)
     client.loop_start()
 
-    # JSON'da control varsa 1 kez gönder
-    if control:
-        client.publish(TOPIC_CTRL, control)
-        print(f"[JSON] {control} komutu gönderildi.")
+    # İlk açılışta JSON'da control varsa bir kere gönder
+    if control_state:
+        client.publish(TOPIC_CTRL, control_state)
+        print(f"[JSON] '{control_state}' komutu gönderildi.")
 
     print("Komutlar:\n  activate | deactivate\n  frame <cmd> <msg> <data>\nCTRL+C ile çıkış")
-
     try:
         while True:
             line = input("> ").strip()
             if not line:
                 continue
-
             if line in ("activate", "deactivate"):
                 client.publish(TOPIC_CTRL, line)
-
             elif line.startswith("frame"):
                 parts = line.split(maxsplit=3)
                 if len(parts) < 4:
@@ -116,10 +143,8 @@ def main():
                 payload = frameHandler.encode_frame(cmd, msgT, data)
                 client.publish(TOPIC_TX, payload)
                 print("Frame gönderildi.")
-
             else:
                 client.publish(TOPIC_TX, line.encode())
-
     except KeyboardInterrupt:
         print("Çıkış yapıldı.")
     finally:
