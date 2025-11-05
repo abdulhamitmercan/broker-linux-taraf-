@@ -68,6 +68,7 @@ control_state = None
 _last_control_sent = 0.0
 _MIN_RESEND_INTERVAL = 1.0
 esp_active = False
+JSON_FILE = "responses.json" # Durum yanıtlarını kaydetmek için kullanılan dosya
 def resend_control(client):
     global _last_control_sent
     if not control_state:
@@ -78,16 +79,54 @@ def resend_control(client):
     client.publish(TOPIC_CTRL, control_state)
     _last_control_sent = now
     print(f"[AUTO] '{control_state}' yeniden gönderildi.")
+# -------- Durum yanıtlarını kaydetme --------
+def save_status_response(topic, data):
+    entry = {"topic": topic, "data": data}
+
+    if not os.path.exists(JSON_FILE):
+        db = {"message_response": [{"cmd": 0, "msg": 0, "data": ""}],
+              "status_response": entry}
+    else:
+        with open(JSON_FILE, "r", encoding="utf-8") as f:
+            db = json.load(f)
+        db["status_response"] = entry  # doğrudan overwrite
+
+    with open(JSON_FILE, "w", encoding="utf-8") as f:
+        json.dump(db, f, ensure_ascii=False, indent=2)
+
+
+
+def save_frame_response(cmd, msg, data):
+    entry = {"cmd": cmd, "msg": msg, "data": data}
+
+    if not os.path.exists(JSON_FILE):
+        db = {"message_response": [entry],
+              "status_response": {"topic": "", "data": ""}}
+    else:
+        with open(JSON_FILE, "r", encoding="utf-8") as f:
+            db = json.load(f)
+        # her zaman ilk ve tek kaydı güncelle
+        if "message_response" not in db or not isinstance(db["message_response"], list) or not db["message_response"]:
+            db["message_response"] = [entry]
+        else:
+            db["message_response"][0] = entry
+
+    with open(JSON_FILE, "w", encoding="utf-8") as f:
+        json.dump(db, f, ensure_ascii=False, indent=2)
+     
 
 # -------- MQTT CALLBACK --------
 def on_message(client, userdata, msg):
+    global esp_active
     payload = msg.payload
     decoded = frameHandler.decode_frame(payload)
     if decoded:
         print(f"[{msg.topic}] FRAME → Cmd:{decoded[0]}, Msg:{decoded[1]}, Data:{decoded[2]}")
+        save_frame_response(decoded[0], decoded[1], decoded[2])
         return
     text = payload.decode(errors='ignore')
     print(f"[{msg.topic}] {text}")
+    save_status_response(msg.topic, text)
     if msg.topic == TOPIC_STATUS:
         normalized = text.strip().lower()
 
@@ -152,35 +191,31 @@ async def watch_json_send_message(client):
                 cfg = json.load(f)
                 msg = (cfg.get("send_message") or "").strip()
                 target = (cfg.get("target") or "").strip()
+                
         except Exception as e:
             await asyncio.sleep(1)
-            continue
 
         # ESP aktif değilse atla
         if not esp_active:
+            print("esp nonactive")
             await asyncio.sleep(1)
             continue
 
         # Yeni ve boş olmayan bir mesaj varsa işle
         if msg and msg != last_message:
             parts = msg.strip().split(maxsplit=3)
-
+            print("mesajlar farklı")
             if parts[0].lower() == "frame" and len(parts) == 4:
                 try:
                     cmd = int(parts[1], 0)
                     msgT = int(parts[2], 0)
                     data = parts[3]
                     payload = frameHandler.encode_frame(cmd, msgT, data)
-                    client.publish(f"{target}/to_server", payload)
+                    client.publish(TOPIC_TX, payload)
                     print(f"[JSON] Frame gönderildi → {msg}")
                 except ValueError:
                     print("[JSON] Hatalı frame formatı:", msg)
-            else:
-                try:
-                    client.publish(f"{target}/to_server", msg.encode())
-                    print(f"[JSON] send_message → {msg}")
-                except Exception as e:
-                    print(f"[JSON] Gönderim hatası: {e}")
+
 
             # Güncel mesajı kaydet
             last_message = msg
